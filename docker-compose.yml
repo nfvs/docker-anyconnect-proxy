@@ -1,0 +1,46 @@
+version: '3.4'
+
+services:
+  vpn:
+    container_name: vpn
+    build:
+      context: .
+      dockerfile: vpn.Dockerfile
+    environment:
+      - ANYCONNECT_SERVER=${ANYCONNECT_SERVER}
+      - ANYCONNECT_USER=${ANYCONNECT_USER}
+      - ANYCONNECT_GROUP=${ANYCONNECT_GROUP}
+      - ANYCONNECT_PASSWORD=${ANYCONNECT_PASSWORD}
+      - ANYCONNECT_CERT=${ANYCONNECT_CERT}
+    networks:
+      - default
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    restart: "no"  # unless-stopped
+    security_opt:
+      - label:disable
+    ports:
+      - "1080:1080"
+  proxy:
+    container_name: proxy
+    build:
+      context: .
+      dockerfile: proxy.Dockerfile
+    healthcheck:
+      test: ["CMD", "/sbin/ifconfig", "tun0"]
+      interval: 10s
+      timeout: 10s
+      start_period: 10s
+    labels:
+      - autoheal=true
+    restart: on-failure
+    depends_on:
+      - vpn
+    network_mode: "service:vpn"
+  autoheal:
+    container_name: autoheal
+    image: willfarrell/autoheal
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
