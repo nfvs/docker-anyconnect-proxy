@@ -2,7 +2,7 @@ version: '3.4'
 
 services:
   vpn:
-    container_name: vpn
+    container_name: ngvpn_vpn
     build:
       context: .
       dockerfile: vpn.Dockerfile
@@ -22,8 +22,9 @@ services:
       - label:disable
     ports:
       - "1080:1080"
+      - "1081:8888"
   proxy:
-    container_name: proxy
+    container_name: ngvpn_proxy
     build:
       context: .
       dockerfile: proxy.Dockerfile
@@ -38,9 +39,13 @@ services:
     depends_on:
       - vpn
     network_mode: "service:vpn"
-  autoheal:
-    container_name: autoheal
-    image: willfarrell/autoheal
-    restart: always
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+  http_proxy:
+    container_name: ngvpn_http_proxy
+    image: dannydirect/tinyproxy
+    command: ["127.0.0.1", "192.168.0.0/16", "172.16.0.0/12"]
+    labels:
+      - autoheal=true
+    restart: on-failure
+    depends_on:
+      - vpn
+    network_mode: "service:vpn"
