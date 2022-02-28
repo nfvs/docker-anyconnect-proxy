@@ -2,7 +2,7 @@ version: '3.4'
 
 services:
   vpn:
-    container_name: ngvpn_vpn
+    container_name: anyconnect_vpn
     build:
       context: .
       dockerfile: vpn.Dockerfile
@@ -19,12 +19,12 @@ services:
       - NET_ADMIN
     restart: "no"  # unless-stopped
     security_opt:
-      - label:disable
+      - label=disable
     ports:
       - "1080:1080"
       - "1081:8888"
   proxy:
-    container_name: ngvpn_proxy
+    container_name: anyconnect_proxy
     build:
       context: .
       dockerfile: proxy.Dockerfile
@@ -40,7 +40,7 @@ services:
       - vpn
     network_mode: "service:vpn"
   http_proxy:
-    container_name: ngvpn_http_proxy
+    container_name: anyconnect_http_proxy
     image: dannydirect/tinyproxy
     command: ["127.0.0.1", "192.168.0.0/16", "172.16.0.0/12"]
     labels:

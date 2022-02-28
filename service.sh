@@ -3,7 +3,11 @@
 CODE_PATH="$HOME/.docker-anyconnect"
 
 # Add password to mac keychain: security add-generic-password -a <user> -s <service> -w
-ANYCONNECT_PASSWORD=$(security find-generic-password -a $(id -un) -s ngvpn.nvidia.com -w)
+ANYCONNECT_PASSWORD=$(security find-generic-password -a $(id -un) -s anyconnect_vpn -w)
+# Duo code?
+if [ -n "$2" ]; then
+    ANYCONNECT_PASSWORD="$ANYCONNECT_PASSWORD,$2"
+fi
 export ANYCONNECT_PASSWORD
 
 DOCKER_COMPOSE="docker-compose"
@@ -13,13 +17,11 @@ DOCKER_COMPOSE="docker-compose"
 
 DOCKER_COMPOSE_UP_ARGS="--detach"
 
-while [ "$#" -gt 0 ]
-do
-key="$1"
+op="$1"
 
-case $key in
+case $op in
     on|up)
-    (cd "$CODE_PATH" && ${DOCKER_COMPOSE} up ${DOCKER_COMPOSE_UP_ARGS})
+    (cd "$CODE_PATH" && ${DOCKER_COMPOSE} rm -f && ${DOCKER_COMPOSE} up ${DOCKER_COMPOSE_UP_ARGS})
     shift
     ;;
     off|down)
@@ -30,6 +32,10 @@ case $key in
     (cd "$CODE_PATH" && docker restart ngvpn_vpn)
     shift
     ;;
+    rm)
+    (cd "$CODE_PATH" && ${DOCKER_COMPOSE} rm)
+    shift
+    ;;
     ps|status)
     (cd "$CODE_PATH" && ${DOCKER_COMPOSE} ps)
     shift
@@ -38,5 +44,4 @@ case $key in
     shift # past argument
     ;;
 esac
-done
 
