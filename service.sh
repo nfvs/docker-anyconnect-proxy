@@ -21,15 +21,23 @@ op="$1"
 
 case $op in
     on|up)
-    (cd "$CODE_PATH" && ${DOCKER_COMPOSE} rm -f && ${DOCKER_COMPOSE} up ${DOCKER_COMPOSE_UP_ARGS})
+    if [ -z "$2" ]; then
+        echo "No login code provided, use 'up <code>' instead."
+        exit 1
+    fi
+    (cd "$CODE_PATH" && ${DOCKER_COMPOSE} up ${DOCKER_COMPOSE_UP_ARGS})
     shift
     ;;
     off|down)
     (cd "$CODE_PATH" && ${DOCKER_COMPOSE} down)
     shift
     ;;
+    clean)
+    (cd "$CODE_PATH" && ${DOCKER_COMPOSE} rm -f)
+    shift
+    ;;
     restart)
-    (cd "$CODE_PATH" && docker restart ngvpn_vpn)
+    (cd "$CODE_PATH" && docker restart anyconnect_vpn)
     shift
     ;;
     rm)
