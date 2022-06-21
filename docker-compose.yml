@@ -1,4 +1,4 @@
-version: '3.4'
+version: "3.4"
 
 services:
   vpn:
@@ -17,12 +17,13 @@ services:
     privileged: true
     cap_add:
       - NET_ADMIN
-    restart: "no"  # unless-stopped
+    restart: "no" # unless-stopped
     security_opt:
       - label=disable
     ports:
-      - "1080:1080"
-      - "1081:8888"
+      - "1080:1080" # proxy
+      - "1081:8888" # http_proxy
+      - "2222:2222" # ssh
   proxy:
     container_name: anyconnect_proxy
     build:
@@ -46,6 +47,22 @@ services:
     labels:
       - autoheal=true
     restart: on-failure
+    depends_on:
+      - vpn
+    network_mode: "service:vpn"
+  openssh-server:
+    image: lscr.io/linuxserver/openssh-server
+    container_name: anyconnect_ssh
+    environment:
+      - PUID=0
+      - PGID=0
+      - PUBLIC_KEY=${ANYCONNECT_PUBLIC_KEY}
+      - SUDO_ACCESS=true
+      - PASSWORD_ACCESS=false
+      - USER_NAME=${ANYCONNECT_USER}
+    volumes:
+      - ./ssh_init:/config/custom-cont-init.d:rw
+    restart: unless-stopped
     depends_on:
       - vpn
     network_mode: "service:vpn"
