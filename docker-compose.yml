@@ -17,6 +17,8 @@ services:
     privileged: true
     cap_add:
       - NET_ADMIN
+    devices:
+      - /dev/net/tun
     restart: "no" # unless-stopped
     security_opt:
       - label=disable

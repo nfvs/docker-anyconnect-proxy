@@ -20,9 +20,5 @@ sed -i "s/^CSD_HOSTNAME=.*$/CSD_HOSTNAME=${ANYCONNECT_SERVER}/" $HOME/.csd-wrapp
 
 OPENCONNECT_ARGS=("$ANYCONNECT_SERVER" --user="$ANYCONNECT_USER" --authgroup="$ANYCONNECT_GROUP" --timestamp --passwd-on-stdin --servercert "$ANYCONNECT_CERT")
 
-if [ -n $ANYCONNECT_PASSWORD ]; then
-    openconnect ${OPENCONNECT_ARGS[@]} $@
-else
-    ( echo "$ANYCONNECT_PASSWORD" ) | openconnect ${OPENCONNECT_ARGS[@]} $@
-fi
+( echo "$ANYCONNECT_PASSWORD" ) | openconnect ${OPENCONNECT_ARGS[@]} $@
 
