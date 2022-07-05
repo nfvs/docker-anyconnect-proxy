@@ -1,14 +1,24 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 
-CODE_PATH="$HOME/.docker-anyconnect"
+CODE_PATH="$HOME/.docker-anyconnect-proxy"
 
-# Add password to mac keychain: security add-generic-password -a <user> -s <service> -w
-ANYCONNECT_PASSWORD=$(security find-generic-password -a $(id -un) -s anyconnect_vpn -w)
-# Duo code?
-if [ -n "$2" ]; then
-    ANYCONNECT_PASSWORD="$ANYCONNECT_PASSWORD,$2"
-fi
-export ANYCONNECT_PASSWORD
+read_credentials() {
+    # Add password to mac keychain: security add-generic-password -a <user> -s <service> -w
+    if command -v security > /dev/null 2>&1; then
+        ANYCONNECT_PASSWORD=$(security find-generic-password -a $(id -un) -s anyconnect_vpn -w)
+        if [ -z "$2" ]; then
+            echo "No login code provided, use 'up <code>' instead.";
+            echo -n "Enter code: ";
+            read -p ANYCONNECT_CODE;
+            ANYCONNECT_PASSWORD="$ANYCONNECT_PASSWORD,$ANYCONNECT_CODE"
+        fi
+    else
+        echo "Enter the password, followed by a comma and the code";
+        read -s ANYCONNECT_PASSWORD;
+    fi
+
+    export ANYCONNECT_PASSWORD
+}
 
 DOCKER_COMPOSE="docker-compose"
 # if [ -n "$(docker compose)" ]; then
@@ -21,10 +31,7 @@ op="$1"
 
 case $op in
     on|up)
-    if [ -z "$2" ]; then
-        echo "No login code provided, use 'up <code>' instead."
-        exit 1
-    fi
+    read_credentials
     (cd "$CODE_PATH" && ${DOCKER_COMPOSE} up ${DOCKER_COMPOSE_UP_ARGS})
     shift
     ;;
