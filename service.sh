@@ -10,8 +10,10 @@ read_credentials() {
             echo "No login code provided, use 'up <code>' instead.";
             echo -n "Enter code: ";
             read -p ANYCONNECT_CODE;
-            ANYCONNECT_PASSWORD="$ANYCONNECT_PASSWORD,$ANYCONNECT_CODE"
+        else
+            ANYCONNECT_CODE="$2"
         fi
+        ANYCONNECT_PASSWORD="$ANYCONNECT_PASSWORD,$ANYCONNECT_CODE"
     else
         echo "Enter the password, followed by a comma and the code";
         read -s ANYCONNECT_PASSWORD;
@@ -31,7 +33,7 @@ op="$1"
 
 case $op in
     on|up)
-    read_credentials
+    read_credentials "$@"
     (cd "$CODE_PATH" && ${DOCKER_COMPOSE} up ${DOCKER_COMPOSE_UP_ARGS})
     shift
     ;;
