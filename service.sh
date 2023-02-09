@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
-CODE_PATH="$HOME/.docker-anyconnect-proxy"
+SCRIPT_PATH="$(readlink -f "$(readlink "${BASH_SOURCE[0]}")")"
+CODE_PATH=$(dirname "${SCRIPT_PATH}")
 
 read_credentials() {
     # Add password to mac keychain: security add-generic-password -a <user> -s <service> -w
@@ -37,7 +38,7 @@ case $op in
     (cd "$CODE_PATH" && ${DOCKER_COMPOSE} up ${DOCKER_COMPOSE_UP_ARGS})
     shift
     ;;
-    off|down)
+    off)
     (cd "$CODE_PATH" && ${DOCKER_COMPOSE} down)
     shift
     ;;
@@ -49,15 +50,16 @@ case $op in
     (cd "$CODE_PATH" && docker restart anyconnect_vpn)
     shift
     ;;
-    rm)
-    (cd "$CODE_PATH" && ${DOCKER_COMPOSE} rm)
-    shift
-    ;;
-    ps|status)
+    # rm)
+    # (cd "$CODE_PATH" && ${DOCKER_COMPOSE} rm)
+    # shift
+    # ;;
+    status)
     (cd "$CODE_PATH" && ${DOCKER_COMPOSE} ps)
     shift
     ;;
     *)    # unknown option
+    (cd "$CODE_PATH" && ${DOCKER_COMPOSE} $op)
     shift # past argument
     ;;
 esac
