@@ -19,13 +19,23 @@ if [ ! -f "$HOME/.csd-wrapper.sh" ]; then
 fi
 
 # Fill in hostname in csd-wrapper file
-sed -i "s/^CSD_HOSTNAME=.*$/CSD_HOSTNAME=${ANYCONNECT_SERVER}/" $HOME/.csd-wrapper.sh
+# Extract the host using parameter expansion
+CSD_HOSTNAME="${ANYCONNECT_SERVER#*//}" # Remove the protocol (https://)
+CSD_HOSTNAME="${HOST%%/*}"              # Remove everything after the first slash
+sed -i "s/^CSD_HOSTNAME=.*$/CSD_HOSTNAME=${CSD_HOSTNAME}/" "$HOME/.csd-wrapper.sh"
 
-OPENCONNECT_ARGS=("$ANYCONNECT_SERVER" --allow-insecure-crypto --user="$ANYCONNECT_USER" --authgroup="$ANYCONNECT_GROUP" --timestamp --passwd-on-stdin --servercert "$ANYCONNECT_CERT" --useragent ${ANYCONNECT_USERAGENT})
+if [[ -n "${ANYCONNECT_COOKIE}" ]]; then
+    OPENCONNECT_ARGS=("$ANYCONNECT_SERVER" --cookie-on-stdin --resolve "${ANYCONNECT_RESOLVE}" --servercert "${ANYCONNECT_CERT}")
 
-if [[ -n "$ANYCONNECT_CERT" ]]; then
-    OPENCONNECT_ARGS+=(--servercert "${ANYCONNECT_CERT}")
+    openconnect "${OPENCONNECT_ARGS[@]}" <<<"${ANYCONNECT_COOKIE}"
+else
+    # OPENCONNECT_ARGS=("$ANYCONNECT_SERVER" --allow-insecure-crypto --user="$ANYCONNECT_USER" --authgroup="$ANYCONNECT_GROUP" --timestamp --passwd-on-stdin --servercert "$ANYCONNECT_CERT" --useragent ${ANYCONNECT_USERAGENT})
+    OPENCONNECT_ARGS=("$ANYCONNECT_SERVER" --allow-insecure-crypto --user="$ANYCONNECT_USER" --authgroup="$ANYCONNECT_GROUP" --timestamp --passwd-on-stdin --servercert "$ANYCONNECT_CERT")
+    OPENCONNET_ARGS+=(--useragent "${ANYCONNECT_USERAGENT}")
+
+    if [[ -n "$ANYCONNECT_CERT" ]]; then
+        OPENCONNECT_ARGS+=(--servercert "${ANYCONNECT_CERT}")
+    fi
+
+    echo "$ANYCONNECT_PASSWORD" | openconnect "${OPENCONNECT_ARGS[@]}"
 fi
-
-echo "$ANYCONNECT_PASSWORD" | openconnect "${OPENCONNECT_ARGS[@]}"
-
