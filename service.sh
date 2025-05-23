@@ -5,6 +5,7 @@ set -e
 SCRIPT_PATH="$(readlink -f "$(readlink "${BASH_SOURCE[0]}")")"
 CODE_PATH=$(dirname "${SCRIPT_PATH}")
 COOKIE_PATH="${CODE_PATH}/.cookie"
+ANYCONNECT_USERAGENT="AnyConnect-compatible OpenConnect VPN Agent"
 
 if [ -f "$CODE_PATH/.env" ]; then
     source "$CODE_PATH/.env"
@@ -45,30 +46,43 @@ saml_flow() {
     # Test connection first; if it succeeds, the cookie is still valid so pass it along to the container
     if [[ -s "$COOKIE_PATH" ]]; then
         echo "Using existing cookie..."
-        output=$(openconnect --useragent="AnyConnect-compatible OpenConnect VPN Agent" --cookie "$(cat "$COOKIE_PATH")" "${ANYCONNECT_SERVER}" 2>&1)
+        # shellcheck disable=SC1090
+        source "${COOKIE_PATH}"
+
+        OPENCONNECT_ARGS=(
+            "$ANYCONNECT_SERVER" \
+            --useragent="${ANYCONNECT_USERAGENT}" \
+            --cookie "${ANYCONNECT_COOKIE}" \
+            --resolve "${ANYCONNECT_RESOLVE}" \
+            --servercert "${ANYCONNECT_CERT}" \
+            --authenticate
+        )
+
+        # output=$(openconnect "${OPENCONNECT_ARGS[@]}" <<<"${ANYCONNECT_COOKIE}")
+        output=$(openconnect "${OPENCONNECT_ARGS[@]}")
         ANYCONNECT_COOKIE=$(echo "$output" | grep -Eo "COOKIE='[^']+" | cut -d"'" -f2)
+        # echo "OUTPUT"
+        # echo "$output"
+        # echo "--------"
 
         # Cookie is valid; load all ANYCONNECT_* variables
-        if [[ "$output" == *"Connected to"* ]]; then
+        if [[ -n "${ANYCONNECT_COOKIE}" ]]; then
             echo "Authentication with the existing cookie was successful."
-            # shellcheck disable=SC1090
-            source "${COOKIE_PATH}"
-
         # Cookie isn't valid, remove the cookie and set output="" to trigger re-authentication
         else
             echo "Authentication with the existing cookie failed, re-authenticating..."
-            output=""
-            rm -f "$COOKIE_PATH"
+            # output=""
+            # rm -f "$COOKIE_PATH"
         fi
 
     fi
 
-    if [[ -z "${output}" ]]; then
-        output=$(openconnect --useragent="AnyConnect-compatible OpenConnect VPN Agent" --authenticate "${ANYCONNECT_SERVER}/SAML-EXT")
+    if [[ -z "${ANYCONNECT_COOKIE}" ]]; then
+        output=$(openconnect --useragent="${ANYCONNECT_USERAGENT}" --authenticate "${ANYCONNECT_SERVER}")
 
         # Parse the variables using grep and sed
         ANYCONNECT_COOKIE=$(echo "$output" | grep -Eo "COOKIE='[^']+" | cut -d"'" -f2)
-        ANYCONNECT_SERVER=$(echo "$output" | grep -Eo "CONNECT_URL='[^']+" | cut -d"'" -f2)
+        ANYCONNECT_SERVER="$(echo "$output" | grep -Eo "CONNECT_URL='[^']+" | cut -d"'" -f2)"
         ANYCONNECT_CERT=$(echo "$output" | grep -Eo "FINGERPRINT='[^']+" | cut -d"'" -f2)
         ANYCONNECT_RESOLVE=$(echo "$output" | grep -Eo "RESOLVE='[^']+" | cut -d"'" -f2)
 
@@ -86,6 +100,7 @@ EOF
     export ANYCONNECT_RESOLVE
     export ANYCONNECT_PUBLIC_KEY
     export ANYCONNECT_USER
+    export ANYCONNECT_USERAGENT
 }
 
 DOCKER_COMPOSE="docker-compose"
@@ -99,9 +114,9 @@ op="$1"
 
 case $op in
 on | up)
-    # read_credentials "$@"
     authenticate
     (cd "$CODE_PATH" && ${DOCKER_COMPOSE} up ${DOCKER_COMPOSE_UP_ARGS})
+    docker logs anyconnect_vpn
     shift
     ;;
 off)
