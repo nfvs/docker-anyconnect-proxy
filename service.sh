@@ -27,9 +27,18 @@ read_credentials() {
     export ANYCONNECT_PASSWORD
 }
 
+authenticate() {
+    if [[ "${ANYCONNECT_SERVER}" == *"/SAML-EXT" ]]; then
+        saml_flow
+    else
+        echo "Unsupported server: ${ANYCONNECT_SERVER}; only SAML-EXT is supported"
+        exit 1
+    fi
+}
+
 saml_flow() {
     local output
-    output=$(openconnect --useragent="AnyConnect-compatible OpenConnect VPN Agent" --authenticate "${ANYCONNECT_SERVER}/SAML-EXT")
+    output=$(openconnect --useragent="AnyConnect-compatible OpenConnect VPN Agent" --authenticate "${ANYCONNECT_SERVER}")
     # Parse the variables using grep and sed
     ANYCONNECT_COOKIE=$(echo "$output" | grep -Eo "COOKIE='[^']+" | cut -d"'" -f2)
     ANYCONNECT_SERVER=$(echo "$output" | grep -Eo "CONNECT_URL='[^']+" | cut -d"'" -f2)
@@ -53,7 +62,7 @@ op="$1"
 case $op in
 on | up)
     # read_credentials "$@"
-    saml_flow
+    authenticate
     (cd "$CODE_PATH" && ${DOCKER_COMPOSE} up ${DOCKER_COMPOSE_UP_ARGS})
     shift
     ;;
