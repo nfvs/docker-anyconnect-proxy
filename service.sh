@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 
+set -e
+
 SCRIPT_PATH="$(readlink -f "$(readlink "${BASH_SOURCE[0]}")")"
 CODE_PATH=$(dirname "${SCRIPT_PATH}")
+COOKIE_PATH="${CODE_PATH}/.cookie"
 
 if [ -f "$CODE_PATH/.env" ]; then
     source "$CODE_PATH/.env"
@@ -38,16 +41,51 @@ authenticate() {
 
 saml_flow() {
     local output
-    output=$(openconnect --useragent="AnyConnect-compatible OpenConnect VPN Agent" --authenticate "${ANYCONNECT_SERVER}")
-    # Parse the variables using grep and sed
-    ANYCONNECT_COOKIE=$(echo "$output" | grep -Eo "COOKIE='[^']+" | cut -d"'" -f2)
-    ANYCONNECT_SERVER=$(echo "$output" | grep -Eo "CONNECT_URL='[^']+" | cut -d"'" -f2)
-    ANYCONNECT_CERT=$(echo "$output" | grep -Eo "FINGERPRINT='[^']+" | cut -d"'" -f2)
-    ANYCONNECT_RESOLVE=$(echo "$output" | grep -Eo "RESOLVE='[^']+" | cut -d"'" -f2)
+
+    # Test connection first; if it succeeds, the cookie is still valid so pass it along to the container
+    if [[ -s "$COOKIE_PATH" ]]; then
+        echo "Using existing cookie..."
+        output=$(openconnect --useragent="AnyConnect-compatible OpenConnect VPN Agent" --cookie "$(cat "$COOKIE_PATH")" "${ANYCONNECT_SERVER}" 2>&1)
+        ANYCONNECT_COOKIE=$(echo "$output" | grep -Eo "COOKIE='[^']+" | cut -d"'" -f2)
+
+        # Cookie is valid; load all ANYCONNECT_* variables
+        if [[ "$output" == *"Connected to"* ]]; then
+            echo "Authentication with the existing cookie was successful."
+            # shellcheck disable=SC1090
+            source "${COOKIE_PATH}"
+
+        # Cookie isn't valid, remove the cookie and set output="" to trigger re-authentication
+        else
+            echo "Authentication with the existing cookie failed, re-authenticating..."
+            output=""
+            rm -f "$COOKIE_PATH"
+        fi
+
+    fi
+
+    if [[ -z "${output}" ]]; then
+        output=$(openconnect --useragent="AnyConnect-compatible OpenConnect VPN Agent" --authenticate "${ANYCONNECT_SERVER}/SAML-EXT")
+
+        # Parse the variables using grep and sed
+        ANYCONNECT_COOKIE=$(echo "$output" | grep -Eo "COOKIE='[^']+" | cut -d"'" -f2)
+        ANYCONNECT_SERVER=$(echo "$output" | grep -Eo "CONNECT_URL='[^']+" | cut -d"'" -f2)
+        ANYCONNECT_CERT=$(echo "$output" | grep -Eo "FINGERPRINT='[^']+" | cut -d"'" -f2)
+        ANYCONNECT_RESOLVE=$(echo "$output" | grep -Eo "RESOLVE='[^']+" | cut -d"'" -f2)
+
+        cat <<EOF >"${COOKIE_PATH}"
+export ANYCONNECT_SERVER='$ANYCONNECT_SERVER'
+export ANYCONNECT_CERT='$ANYCONNECT_CERT'
+export ANYCONNECT_RESOLVE='$ANYCONNECT_RESOLVE'
+export ANYCONNECT_COOKIE='$ANYCONNECT_COOKIE'
+EOF
+    fi
+
     export ANYCONNECT_COOKIE
     export ANYCONNECT_SERVER
     export ANYCONNECT_CERT
     export ANYCONNECT_RESOLVE
+    export ANYCONNECT_PUBLIC_KEY
+    export ANYCONNECT_USER
 }
 
 DOCKER_COMPOSE="docker-compose"

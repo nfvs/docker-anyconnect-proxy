@@ -21,9 +21,15 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun
-    restart: "no" # unless-stopped
+    restart: unless-stopped
     security_opt:
       - label=disable
+    healthcheck:
+      test: ["CMD", "/sbin/ifconfig", "tun0"]
+      interval: 10s
+      timeout: 10s
+      start_period: 10s
+    labels: []
     ports:
       - "1080:1080" # proxy
       - "1081:8888" # http_proxy
@@ -38,22 +44,20 @@ services:
       interval: 10s
       timeout: 10s
       start_period: 10s
-    labels:
-      - autoheal=true
     restart: on-failure
     depends_on:
-      - vpn
+      vpn:
+        condition: service_healthy
     network_mode: "service:vpn"
   http_proxy:
     container_name: anyconnect_http_proxy
     platform: linux/amd64
     image: monokal/tinyproxy
     command: ["127.0.0.1", "192.168.0.0/16", "172.16.0.0/12"]
-    labels:
-      - autoheal=true
     restart: on-failure
     depends_on:
-      - vpn
+      vpn:
+        condition: service_healthy
     network_mode: "service:vpn"
   openssh-server:
     image: linuxserver/openssh-server
@@ -69,5 +73,6 @@ services:
       - ./ssh_init:/config/custom-cont-init.d:rw
     restart: unless-stopped
     depends_on:
-      - vpn
+      vpn:
+        condition: service_healthy
     network_mode: "service:vpn"
