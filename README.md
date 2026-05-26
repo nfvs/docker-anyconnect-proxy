@@ -16,6 +16,9 @@ the service caches that internally for cookie reuse.
 $ ./service.sh up
 ```
 
+Authentication state is stored in `.state/cookie` with restrictive local
+permissions and mounted read-only into the VPN container.
+
 # Proxy settings
 
 Configure clients to use the SOCKS5 proxy:

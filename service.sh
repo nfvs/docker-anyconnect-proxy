@@ -10,7 +10,8 @@ while [[ -L "$SCRIPT_PATH" ]]; do
 done
 
 CODE_PATH="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
-COOKIE_PATH="${CODE_PATH}/.cookie"
+STATE_DIR="${CODE_PATH}/.state"
+COOKIE_PATH="${STATE_DIR}/cookie"
 
 if [ -f "$CODE_PATH/.env" ]; then
     source "$CODE_PATH/.env"
@@ -57,6 +58,9 @@ parse_auth_output() {
 write_cookie_file() {
     local tmp_path
 
+    mkdir -p "${STATE_DIR}"
+    chmod 700 "${STATE_DIR}"
+
     tmp_path="$(umask 077 && mktemp "${COOKIE_PATH}.XXXXXX")"
     {
         printf 'export ANYCONNECT_SERVER=%q\n' "$ANYCONNECT_SERVER"
@@ -72,44 +76,41 @@ write_cookie_file() {
 }
 
 compose_up() {
+    local status
+
+    mkdir -p "${STATE_DIR}"
+    chmod 700 "${STATE_DIR}"
+
+    set +e
     (cd "$CODE_PATH" && "${DOCKER_COMPOSE[@]}" up "${DOCKER_COMPOSE_UP_ARGS[@]}" "$@")
-    docker logs --tail 80 anyconnect_vpn
+    status=$?
+    docker logs --tail 80 anyconnect_vpn || true
+    set -e
+
+    return "$status"
 }
 
 start_vpn() {
     authenticate
-    compose_up "$@"
-}
 
-refresh_cookie() {
-    local output status connect_target
-    local openconnect_args
-
-    connect_target="${ANYCONNECT_CONNECT_URL:-${ANYCONNECT_HOST:-$ANYCONNECT_SERVER}}"
-    echo "Refreshing existing cookie..."
-
-    openconnect_args=(
-        --authenticate
-        --useragent="${ANYCONNECT_USERAGENT}"
-        --cookie="${ANYCONNECT_COOKIE}"
-    )
-
-    [[ -n "${ANYCONNECT_RESOLVE:-}" ]] && openconnect_args+=(--resolve "${ANYCONNECT_RESOLVE}")
-    [[ -n "${ANYCONNECT_CERT:-}" ]] && openconnect_args+=(--servercert "${ANYCONNECT_CERT}")
-
-    set +e
-    output=$(openconnect "${openconnect_args[@]}" "${connect_target}" 2>&1)
-    status=$?
-    set -e
-
-    if ((status != 0)) || ! parse_auth_output "$output"; then
-        echo "Authentication with the existing cookie failed, re-authenticating..."
-        ANYCONNECT_COOKIE=""
-        return 1
+    if compose_up "$@"; then
+        return 0
     fi
 
-    echo "Authentication with the existing cookie was successful."
-    write_cookie_file
+    if [[ "${ANYCONNECT_COOKIE_FROM_CACHE:-}" == "1" ]] && vpn_cookie_rejected; then
+        echo "Cached cookie was rejected by the VPN gateway; re-authenticating..."
+        rm -f "${COOKIE_PATH}"
+        ANYCONNECT_COOKIE=""
+        authenticate
+        compose_up "$@"
+        return $?
+    fi
+
+    return 1
+}
+
+vpn_cookie_rejected() {
+    docker logs --tail 120 anyconnect_vpn 2>&1 | grep -Eq "Cookie was rejected by server|401 Unauthorized"
 }
 
 saml_flow() {
@@ -122,17 +123,22 @@ saml_flow() {
     local configured_resolve="${ANYCONNECT_RESOLVE:-}"
     local cached_server
 
+    ANYCONNECT_COOKIE_FROM_CACHE=0
+
     if [[ -s "$COOKIE_PATH" ]]; then
         echo "Using existing cookie..."
         # shellcheck disable=SC1090
         source "${COOKIE_PATH}"
+    fi
+
+    if [[ -n "${ANYCONNECT_COOKIE:-}" ]]; then
         cached_server="${ANYCONNECT_SERVER:-}"
 
         if [[ -n "$cached_server" && "$cached_server" != "$configured_server" ]]; then
             echo "Ignoring existing cookie for ${cached_server}; configured server is ${configured_server}."
             ANYCONNECT_COOKIE=""
-        elif [[ -n "${ANYCONNECT_COOKIE:-}" ]]; then
-            refresh_cookie || true
+        else
+            ANYCONNECT_COOKIE_FROM_CACHE=1
         fi
     fi
 
@@ -161,12 +167,7 @@ saml_flow() {
         write_cookie_file
     fi
 
-    export ANYCONNECT_COOKIE
     export ANYCONNECT_SERVER
-    export ANYCONNECT_CONNECT_URL
-    export ANYCONNECT_HOST
-    export ANYCONNECT_CERT
-    export ANYCONNECT_RESOLVE
     export ANYCONNECT_PUBLIC_KEY
     export ANYCONNECT_USER
     export ANYCONNECT_USERAGENT
@@ -177,9 +178,9 @@ usage() {
 Usage: $(basename "$0") [up|start|on|off|restart|clear|clean|status|help|docker-compose args...]
 
 Commands:
-  up, start, on  Refresh or create the cookie, then start the VPN stack
+  up, start, on  Start the VPN stack with the cached cookie, then re-authenticate if rejected
   off            Stop and remove the stack, keeping the cookie
-  restart        Refresh the cookie and recreate the stack
+  restart        Recreate the stack, then re-authenticate if the cached cookie is rejected
   clear          Delete the cookie, authenticate, then start the stack
   clean          Stop and remove the stack, then delete the cookie
   status         Show stack status
@@ -192,7 +193,7 @@ if docker compose version >/dev/null 2>&1; then
     DOCKER_COMPOSE=(docker compose)
 fi
 
-DOCKER_COMPOSE_UP_ARGS=(--detach --force-recreate --remove-orphans)
+DOCKER_COMPOSE_UP_ARGS=(--detach --build --force-recreate --remove-orphans)
 
 op="${1:-status}"
 shift || true
