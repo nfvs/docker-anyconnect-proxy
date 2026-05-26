@@ -14,6 +14,11 @@ if [ -f "$CURDIR/.env" ]; then
     source "$CURDIR/.env"
 fi
 
+COOKIE_FILE="${ANYCONNECT_COOKIE_FILE:-/run/anyconnect/cookie}"
+if [ -f "$COOKIE_FILE" ]; then
+    source "$COOKIE_FILE"
+fi
+
 CONNECT_TARGET="${ANYCONNECT_CONNECT_URL:-${ANYCONNECT_HOST:-$ANYCONNECT_SERVER}}"
 
 if [ ! -f "$HOME/.csd-wrapper.sh" ]; then
