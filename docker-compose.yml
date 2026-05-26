@@ -1,5 +1,3 @@
-version: "3.4"
-
 services:
   vpn:
     container_name: anyconnect_vpn
@@ -14,6 +12,9 @@ services:
       - ANYCONNECT_CERT=${ANYCONNECT_CERT:-}
       - ANYCONNECT_COOKIE=${ANYCONNECT_COOKIE:-}
       - ANYCONNECT_RESOLVE=${ANYCONNECT_RESOLVE:-}
+      - ANYCONNECT_CONNECT_URL=${ANYCONNECT_CONNECT_URL:-}
+      - ANYCONNECT_HOST=${ANYCONNECT_HOST:-}
+      - ANYCONNECT_USERAGENT=${ANYCONNECT_USERAGENT:-}
     networks:
       - default
     privileged: true
@@ -21,53 +22,62 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun
-    restart: "no" # unless-stopped
+    dns_opt:
+      - ndots:1
+    restart: "no"
     security_opt:
       - label=disable
-    ports:
-      - "1080:1080" # proxy
-      - "1081:8888" # http_proxy
-      - "2222:2222" # ssh
-  proxy:
-    container_name: anyconnect_proxy
-    build:
-      context: .
-      dockerfile: proxy.Dockerfile
     healthcheck:
       test: ["CMD", "/sbin/ifconfig", "tun0"]
       interval: 10s
       timeout: 10s
       start_period: 10s
-    labels:
-      - autoheal=true
+    labels: []
+    ports:
+      - "1080:1080" # proxy
+      # - "1081:8888" # http_proxy
+      # - "2222:2222" # ssh
+  proxy:
+    container_name: anyconnect_proxy
+    build:
+      context: .
+      dockerfile: proxy.Dockerfile
     restart: on-failure
-    depends_on:
-      - vpn
-    network_mode: "service:vpn"
-  http_proxy:
-    container_name: anyconnect_http_proxy
-    platform: linux/amd64
-    image: monokal/tinyproxy
-    command: ["127.0.0.1", "192.168.0.0/16", "172.16.0.0/12"]
-    labels:
-      - autoheal=true
-    restart: on-failure
-    depends_on:
-      - vpn
-    network_mode: "service:vpn"
-  openssh-server:
-    image: linuxserver/openssh-server
-    container_name: anyconnect_ssh
     environment:
-      - PUID=0
-      - PGID=0
-      - PUBLIC_KEY=${ANYCONNECT_PUBLIC_KEY}
-      - SUDO_ACCESS=true
-      - PASSWORD_ACCESS=false
-      - USER_NAME=${ANYCONNECT_USER}
-    volumes:
-      - ./ssh_init:/config/custom-cont-init.d:rw
-    restart: unless-stopped
+      - "REQUIRE_AUTH=false"
     depends_on:
-      - vpn
+      vpn:
+        condition: service_healthy
     network_mode: "service:vpn"
+    healthcheck:
+      test: ["CMD", "/sbin/ifconfig", "tun0"]
+      interval: 10s
+      timeout: 10s
+      start_period: 10s
+  # http_proxy:
+  #   container_name: anyconnect_http_proxy
+  #   platform: linux/amd64
+  #   image: monokal/tinyproxy
+  #   command: ["127.0.0.1", "192.168.0.0/16", "172.16.0.0/12"]
+  #   restart: on-failure
+  #   depends_on:
+  #     vpn:
+  #       condition: service_healthy
+  #   network_mode: "service:vpn"
+  # openssh-server:
+  #   image: linuxserver/openssh-server
+  #   container_name: anyconnect_ssh
+  #   environment:
+  #     - PUID=0
+  #     - PGID=0
+  #     - PUBLIC_KEY=${ANYCONNECT_PUBLIC_KEY}
+  #     - SUDO_ACCESS=true
+  #     - PASSWORD_ACCESS=false
+  #     - USER_NAME=${ANYCONNECT_USER}
+  #   volumes:
+  #     - ./ssh_init:/config/custom-cont-init.d:rw
+  #   restart: unless-stopped
+  #   depends_on:
+  #     vpn:
+  #       condition: service_healthy
+  #   network_mode: "service:vpn"
