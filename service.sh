@@ -19,6 +19,12 @@ fi
 
 ANYCONNECT_USERAGENT="${ANYCONNECT_USERAGENT:-AnyConnect-compatible OpenConnect VPN Agent}"
 
+readonly CONFIGURED_SERVER="${ANYCONNECT_SERVER:-}"
+readonly CONFIGURED_CONNECT_URL="${ANYCONNECT_CONNECT_URL:-}"
+readonly CONFIGURED_HOST="${ANYCONNECT_HOST:-}"
+readonly CONFIGURED_CERT="${ANYCONNECT_CERT:-}"
+readonly CONFIGURED_RESOLVE="${ANYCONNECT_RESOLVE:-}"
+
 authenticate() {
     if [[ "${ANYCONNECT_SERVER}" == *"/SAML-EXT" ]]; then
         saml_flow
@@ -53,25 +59,26 @@ parse_auth_output() {
     [[ -n "$resolve" ]] && ANYCONNECT_RESOLVE="$resolve"
     [[ -n "$host" ]] && ANYCONNECT_HOST="$host"
     [[ -n "$connect_url" ]] && ANYCONNECT_CONNECT_URL="$connect_url"
+
+    return 0
 }
 
 write_cookie_file() {
     local tmp_path
 
-    mkdir -p "${STATE_DIR}"
-    chmod 700 "${STATE_DIR}"
+    mkdir -p "${STATE_DIR}" || return $?
+    chmod 700 "${STATE_DIR}" || return $?
 
-    tmp_path="$(umask 077 && mktemp "${COOKIE_PATH}.XXXXXX")"
-    {
-        printf 'export ANYCONNECT_SERVER=%q\n' "$ANYCONNECT_SERVER"
-        printf 'export ANYCONNECT_CONNECT_URL=%q\n' "${ANYCONNECT_CONNECT_URL:-}"
-        printf 'export ANYCONNECT_HOST=%q\n' "${ANYCONNECT_HOST:-}"
-        printf 'export ANYCONNECT_CERT=%q\n' "${ANYCONNECT_CERT:-}"
-        printf 'export ANYCONNECT_RESOLVE=%q\n' "${ANYCONNECT_RESOLVE:-}"
-        printf 'export ANYCONNECT_COOKIE=%q\n' "$ANYCONNECT_COOKIE"
-    } >"${tmp_path}"
+    tmp_path="$(umask 077 && mktemp "${COOKIE_PATH}.XXXXXX")" || return $?
+    printf 'export %s=%q\n' \
+        ANYCONNECT_SERVER "$ANYCONNECT_SERVER" \
+        ANYCONNECT_CONNECT_URL "${ANYCONNECT_CONNECT_URL:-}" \
+        ANYCONNECT_HOST "${ANYCONNECT_HOST:-}" \
+        ANYCONNECT_CERT "${ANYCONNECT_CERT:-}" \
+        ANYCONNECT_RESOLVE "${ANYCONNECT_RESOLVE:-}" \
+        ANYCONNECT_COOKIE "$ANYCONNECT_COOKIE" >"${tmp_path}" || return $?
 
-    chmod 600 "${tmp_path}"
+    chmod 600 "${tmp_path}" || return $?
     mv "${tmp_path}" "${COOKIE_PATH}"
 }
 
@@ -81,46 +88,65 @@ compose_up() {
     mkdir -p "${STATE_DIR}"
     chmod 700 "${STATE_DIR}"
 
+    COMPOSE_START_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     set +e
-    (cd "$CODE_PATH" && "${DOCKER_COMPOSE[@]}" up "${DOCKER_COMPOSE_UP_ARGS[@]}" "$@")
+    (cd "$CODE_PATH" && "${DOCKER_COMPOSE[@]}" up "$@")
     status=$?
-    docker logs --tail 80 anyconnect_vpn || true
+    docker logs --since "$COMPOSE_START_TIME" --tail 80 anyconnect_vpn || true
     set -e
 
     return "$status"
 }
 
+stack_ready() {
+    local proxy_state vpn_state
+
+    vpn_state=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' anyconnect_vpn 2>/dev/null) || return 1
+    proxy_state=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' anyconnect_proxy 2>/dev/null) || return 1
+
+    [[ "$vpn_state" == "running healthy" && "$proxy_state" == "running healthy" ]]
+}
+
 start_vpn() {
-    authenticate
+    local failure_reason
+
+    authenticate || return $?
 
     if compose_up "$@"; then
         return 0
     fi
 
-    if [[ "${ANYCONNECT_COOKIE_FROM_CACHE:-}" == "1" ]] && vpn_cookie_rejected; then
-        echo "Cached cookie was rejected by the VPN gateway; re-authenticating..."
+    if [[ "${ANYCONNECT_COOKIE_FROM_CACHE:-}" == "1" ]] && failure_reason=$(vpn_cached_auth_failure); then
+        echo "Cached ${failure_reason}; re-authenticating..."
         rm -f "${COOKIE_PATH}"
         ANYCONNECT_COOKIE=""
-        authenticate
-        compose_up "$@"
+        authenticate || return $?
+        # Recreate namespace-sharing services after cached authentication fails.
+        # Restarting only the VPN can leave the proxy attached to the old network
+        # namespace and permanently unhealthy.
+        compose_up --force-recreate "$@"
         return $?
     fi
 
     return 1
 }
 
-vpn_cookie_rejected() {
-    docker logs --tail 120 anyconnect_vpn 2>&1 | grep -Eq "Cookie was rejected by server|401 Unauthorized"
+vpn_cached_auth_failure() {
+    local logs
+
+    logs=$(docker logs --since "$COMPOSE_START_TIME" --tail 120 anyconnect_vpn 2>&1) || return 1
+    if printf '%s\n' "$logs" | grep -Eq "None of the [0-9]+ fingerprint\(s\) specified via --servercert match server's certificate"; then
+        echo "certificate pin no longer matches the VPN gateway"
+    elif printf '%s\n' "$logs" | grep -Eq "Cookie was rejected by server|401 Unauthorized"; then
+        echo "cookie was rejected by the VPN gateway"
+    else
+        return 1
+    fi
 }
 
 saml_flow() {
     local output
     local openconnect_args
-    local configured_server="${ANYCONNECT_SERVER}"
-    local configured_connect_url="${ANYCONNECT_CONNECT_URL:-}"
-    local configured_host="${ANYCONNECT_HOST:-}"
-    local configured_cert="${ANYCONNECT_CERT:-}"
-    local configured_resolve="${ANYCONNECT_RESOLVE:-}"
     local cached_server
 
     ANYCONNECT_COOKIE_FROM_CACHE=0
@@ -134,8 +160,8 @@ saml_flow() {
     if [[ -n "${ANYCONNECT_COOKIE:-}" ]]; then
         cached_server="${ANYCONNECT_SERVER:-}"
 
-        if [[ -n "$cached_server" && "$cached_server" != "$configured_server" ]]; then
-            echo "Ignoring existing cookie for ${cached_server}; configured server is ${configured_server}."
+        if [[ -n "$cached_server" && "$cached_server" != "$CONFIGURED_SERVER" ]]; then
+            echo "Ignoring existing cookie for ${cached_server}; configured server is ${CONFIGURED_SERVER}."
             ANYCONNECT_COOKIE=""
         else
             ANYCONNECT_COOKIE_FROM_CACHE=1
@@ -143,11 +169,11 @@ saml_flow() {
     fi
 
     if [[ -z "${ANYCONNECT_COOKIE}" ]]; then
-        ANYCONNECT_SERVER="$configured_server"
-        ANYCONNECT_CONNECT_URL="$configured_connect_url"
-        ANYCONNECT_HOST="$configured_host"
-        ANYCONNECT_CERT="$configured_cert"
-        ANYCONNECT_RESOLVE="$configured_resolve"
+        ANYCONNECT_SERVER="$CONFIGURED_SERVER"
+        ANYCONNECT_CONNECT_URL="$CONFIGURED_CONNECT_URL"
+        ANYCONNECT_HOST="$CONFIGURED_HOST"
+        ANYCONNECT_CERT="$CONFIGURED_CERT"
+        ANYCONNECT_RESOLVE="$CONFIGURED_RESOLVE"
 
         echo "Connecting to ${ANYCONNECT_SERVER}..."
         openconnect_args=(
@@ -158,13 +184,13 @@ saml_flow() {
         [[ -n "${ANYCONNECT_RESOLVE:-}" ]] && openconnect_args+=(--resolve "${ANYCONNECT_RESOLVE}")
         [[ -n "${ANYCONNECT_CERT:-}" ]] && openconnect_args+=(--servercert "${ANYCONNECT_CERT}")
 
-        output=$(openconnect "${openconnect_args[@]}" "${ANYCONNECT_SERVER}")
+        output=$(openconnect "${openconnect_args[@]}" "${ANYCONNECT_SERVER}") || return $?
         if ! parse_auth_output "$output"; then
             echo "Failed to parse authentication cookie from openconnect output."
             exit 1
         fi
 
-        write_cookie_file
+        write_cookie_file || return $?
     fi
 
     export ANYCONNECT_SERVER
@@ -175,12 +201,13 @@ saml_flow() {
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [up|start|on|off|restart|clear|clean|status|help|docker-compose args...]
+Usage: $(basename "$0") [up|start|on|off|restart|rebuild|clear|clean|status|help|docker-compose args...]
 
 Commands:
-  up, start, on  Start the VPN stack with the cached cookie, then re-authenticate if rejected
+  up, start, on  No-op if running; otherwise start with the cached cookie
   off            Stop and remove the stack, keeping the cookie
-  restart        Recreate the stack, then re-authenticate if the cached cookie is rejected
+  restart        Recreate the stack with the cached cookie, without rebuilding
+  rebuild        Build images and recreate the stack
   clear          Delete the cookie, authenticate, then start the stack
   clean          Stop and remove the stack, then delete the cookie
   status         Show stack status
@@ -193,28 +220,37 @@ if docker compose version >/dev/null 2>&1; then
     DOCKER_COMPOSE=(docker compose)
 fi
 
-DOCKER_COMPOSE_UP_ARGS=(--detach --build --force-recreate --remove-orphans)
+DOCKER_COMPOSE_UP_ARGS=(--detach --remove-orphans)
+DOCKER_COMPOSE_RESTART_ARGS=(--detach --force-recreate --remove-orphans)
+DOCKER_COMPOSE_REBUILD_ARGS=(--detach --build --force-recreate --remove-orphans)
 
 op="${1:-status}"
 shift || true
 
 case $op in
 on | up | start)
-    start_vpn "$@"
+    if stack_ready; then
+        echo "VPN stack is already running; nothing to do."
+        exit 0
+    fi
+    start_vpn "${DOCKER_COMPOSE_UP_ARGS[@]}" "$@"
     ;;
 off)
     (cd "$CODE_PATH" && "${DOCKER_COMPOSE[@]}" down "$@")
     ;;
+restart)
+    start_vpn "${DOCKER_COMPOSE_RESTART_ARGS[@]}" "$@"
+    ;;
+rebuild)
+    start_vpn "${DOCKER_COMPOSE_REBUILD_ARGS[@]}" "$@"
+    ;;
 clear)
     rm -f "${COOKIE_PATH}"
-    start_vpn "$@"
+    start_vpn "${DOCKER_COMPOSE_RESTART_ARGS[@]}" "$@"
     ;;
 clean)
     (cd "$CODE_PATH" && "${DOCKER_COMPOSE[@]}" down --remove-orphans "$@")
     rm -f "${COOKIE_PATH}"
-    ;;
-restart)
-    start_vpn "$@"
     ;;
 status)
     (cd "$CODE_PATH" && "${DOCKER_COMPOSE[@]}" ps "$@")

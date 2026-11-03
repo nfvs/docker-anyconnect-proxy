@@ -1,53 +1,37 @@
 #!/bin/bash
 
-if [ $EUID != 0 ]; then
-    sudo "$0" "$@"
-    exit $?
-fi
-
-CURDIR=$(dirname $(realpath $0))
+set -e
 
 # Defaults
-ANYCONNECT_USERAGENT=${ANYCONNECT_USERAGENT:-"AnyConnect Windows 4.10.07062"}
-
-if [ -f "$CURDIR/.env" ]; then
-    source "$CURDIR/.env"
-fi
+ANYCONNECT_USERAGENT=${ANYCONNECT_USERAGENT:-"AnyConnect-compatible OpenConnect VPN Agent"}
 
 COOKIE_FILE="${ANYCONNECT_COOKIE_FILE:-/run/anyconnect/cookie}"
-if [ -f "$COOKIE_FILE" ]; then
-    source "$COOKIE_FILE"
+if [[ ! -f "$COOKIE_FILE" ]]; then
+    echo "Missing cookie file: $COOKIE_FILE"
+    echo "Run ./service.sh clear to authenticate and create one."
+    exit 1
+fi
+
+source "$COOKIE_FILE"
+
+if [[ -z "${ANYCONNECT_COOKIE:-}" ]]; then
+    echo "Cookie file does not contain ANYCONNECT_COOKIE: $COOKIE_FILE"
+    exit 1
 fi
 
 CONNECT_TARGET="${ANYCONNECT_CONNECT_URL:-${ANYCONNECT_HOST:-$ANYCONNECT_SERVER}}"
-
-if [ ! -f "$HOME/.csd-wrapper.sh" ]; then
-    wget --no-check-certificate https://gist.github.com/l0ki000/56845c00fd2a0e76d688/raw/61fc41ac8aec53ae0f9f0dfbfa858c1740307de4/csd-wrapper.sh -O "$HOME/.csd-wrapper.sh"
+if [[ -z "$CONNECT_TARGET" ]]; then
+    echo "Cookie file does not contain a VPN connect target."
+    exit 1
 fi
 
-# Fill in hostname in csd-wrapper file
-# Extract the host using parameter expansion
-CSD_HOSTNAME="${CONNECT_TARGET#*//}" # Remove the protocol (https://)
-CSD_HOSTNAME="${CSD_HOSTNAME%%/*}"   # Remove everything after the first slash
-sed -i "s/^CSD_HOSTNAME=.*$/CSD_HOSTNAME=${CSD_HOSTNAME}/" "$HOME/.csd-wrapper.sh"
+OPENCONNECT_ARGS=(
+    "$CONNECT_TARGET"
+    --cookie-on-stdin
+    --useragent "${ANYCONNECT_USERAGENT}"
+)
 
-if [[ -n "${ANYCONNECT_COOKIE}" ]]; then
-    OPENCONNECT_ARGS=(
-        "$CONNECT_TARGET"
-        --cookie-on-stdin
-        --useragent "${ANYCONNECT_USERAGENT}"
-    )
+[[ -n "${ANYCONNECT_RESOLVE:-}" ]] && OPENCONNECT_ARGS+=(--resolve "${ANYCONNECT_RESOLVE}")
+[[ -n "${ANYCONNECT_CERT:-}" ]] && OPENCONNECT_ARGS+=(--servercert "${ANYCONNECT_CERT}")
 
-    [[ -n "${ANYCONNECT_RESOLVE:-}" ]] && OPENCONNECT_ARGS+=(--resolve "${ANYCONNECT_RESOLVE}")
-    [[ -n "${ANYCONNECT_CERT:-}" ]] && OPENCONNECT_ARGS+=(--servercert "${ANYCONNECT_CERT}")
-
-    openconnect "${OPENCONNECT_ARGS[@]}" <<<"${ANYCONNECT_COOKIE}"
-else
-    OPENCONNECT_ARGS=("$ANYCONNECT_SERVER" --allow-insecure-crypto --user="$ANYCONNECT_USER" --authgroup="$ANYCONNECT_GROUP" --timestamp --passwd-on-stdin --useragent "${ANYCONNECT_USERAGENT}")
-
-    if [[ -n "$ANYCONNECT_CERT" ]]; then
-        OPENCONNECT_ARGS+=(--servercert "${ANYCONNECT_CERT}")
-    fi
-
-    echo "$ANYCONNECT_PASSWORD" | openconnect "${OPENCONNECT_ARGS[@]}"
-fi
+exec openconnect "${OPENCONNECT_ARGS[@]}" <<<"${ANYCONNECT_COOKIE}"
