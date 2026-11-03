@@ -16,8 +16,18 @@ the service caches that internally for cookie reuse.
 $ ./service.sh up
 ```
 
+`./service.sh up` is a no-op when the VPN/proxy containers are already healthy.
+Use `./service.sh restart` to recreate them with the cached cookie and without
+rebuilding images. Use `./service.sh rebuild` after changing Dockerfiles or
+container entrypoint scripts.
+
 Authentication state is stored in `.state/cookie` with restrictive local
-permissions and mounted read-only into the VPN container.
+permissions and mounted read-only into the VPN container. If the cached cookie
+is rejected or its certificate pin no longer matches the gateway, `service.sh`
+reauthenticates once with the original configured endpoint and trust settings,
+then recreates the VPN/proxy containers so the proxy joins the new VPN network
+namespace. A configured certificate pin remains required during authentication;
+other TLS or startup errors do not trigger this retry.
 
 # Proxy settings
 

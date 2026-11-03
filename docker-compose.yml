@@ -6,9 +6,6 @@ services:
       dockerfile: vpn.Dockerfile
     environment:
       - ANYCONNECT_SERVER=${ANYCONNECT_SERVER:-}
-      - ANYCONNECT_USER=${ANYCONNECT_USER:-}
-      - ANYCONNECT_GROUP=${ANYCONNECT_GROUP:-}
-      - ANYCONNECT_PASSWORD=${ANYCONNECT_PASSWORD:-}
       - ANYCONNECT_USERAGENT=${ANYCONNECT_USERAGENT:-}
     volumes:
       - ./.state:/run/anyconnect:ro
