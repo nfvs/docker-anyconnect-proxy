@@ -1,3 +1,5 @@
 **/*
 **/.*
 !entrypoint.sh
+!post-connect.sh
+!restart-openconnect.sh
