@@ -1,264 +1,386 @@
 #!/usr/bin/env bash
 
-set -e
+set -euo pipefail
 
-SCRIPT_PATH="${BASH_SOURCE[0]}"
-while [[ -L "$SCRIPT_PATH" ]]; do
-    SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
-    SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
-    [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_PATH}"
+script_path="${BASH_SOURCE[0]}"
+while [[ -L "$script_path" ]]; do
+    link_dir="$(cd -P "$(dirname "$script_path")" && pwd)"
+    script_path="$(readlink "$script_path")"
+    [[ "$script_path" == /* ]] || script_path="$link_dir/$script_path"
 done
 
-CODE_PATH="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
-STATE_DIR="${CODE_PATH}/.state"
-COOKIE_PATH="${STATE_DIR}/cookie"
+CODE_PATH="$(cd -P "$(dirname "$script_path")" && pwd)"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/anyconnect-proxy"
+COOKIE_PATH="$STATE_DIR/cookie"
 
-if [ -f "$CODE_PATH/.env" ]; then
-    source "$CODE_PATH/.env"
-fi
+NAME=anyconnect
+IMAGE=anyconnect:latest
+PROXY_PORT=1080
+# The VPN uses about 60 MB and one core; Apple's default of 4 CPUs and 1 GB inflates the VM on the Mac.
+CONTAINER_CPUS=2
+CONTAINER_MEMORY=512M
+# Apple's default MTU of 1280 leaves the tunnel an MTU of 1166.
+NETWORK_MTU=1500
+# Apple's kernel has no vhost-net, so openconnect drains DTLS slowly; the default buffer drops bursts.
+UDP_RECEIVE_BUFFER_BYTES=$((4 * 1024 * 1024))
+# Long enough for openconnect to log the session out on SIGTERM.
+STOP_TIMEOUT=20
+READY_TIMEOUT="${ANYCONNECT_READY_TIMEOUT:-60}"
+TRAFFIC_TIMEOUT="${ANYCONNECT_TRAFFIC_TIMEOUT:-10}"
+DNS_QUERY_TIMEOUT=3
+POLL_INTERVAL="${ANYCONNECT_POLL_INTERVAL:-1}"
+TIMED_OUT_STATUS=2
 
-ANYCONNECT_USERAGENT="${ANYCONNECT_USERAGENT:-AnyConnect-compatible OpenConnect VPN Agent}"
+DEFAULT_USERAGENT="AnyConnect-compatible OpenConnect VPN Agent"
+EMPTY_PIN="pin-sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+VPN_RESOLV_CONF=/etc/resolv.vpn.conf
+TUNNEL_CHECK="ip link show tun0 | grep -q '[<,]UP[,>]' && netstat -ltn | grep -q ':$PROXY_PORT '"
+# Asks each of the VPN's nameservers, past the DNS cache, for its own name until one replies. Busybox prints "Server:"
+# only once a reply arrives, so any reply, even NXDOMAIN, proves that the tunnel carries traffic.
+TRAFFIC_CHECK="for server in \$(awk '/^nameserver/ { print \$2 }' $VPN_RESOLV_CONF); do \
+    timeout $DNS_QUERY_TIMEOUT nslookup \$server \$server | grep -q '^Server:' && exit 0; done; exit 1"
+REJECTED_SESSION="Cookie was rejected by server|401 Unauthorized|None of the [0-9]+ fingerprint\(s\) specified via --servercert match"
 
-readonly CONFIGURED_SERVER="${ANYCONNECT_SERVER:-}"
-readonly CONFIGURED_CONNECT_URL="${ANYCONNECT_CONNECT_URL:-}"
-readonly CONFIGURED_HOST="${ANYCONNECT_HOST:-}"
-readonly CONFIGURED_CERT="${ANYCONNECT_CERT:-}"
-readonly CONFIGURED_RESOLVE="${ANYCONNECT_RESOLVE:-}"
+die() {
+    echo "$*" >&2
+    exit 1
+}
 
-authenticate() {
-    if [[ "${ANYCONNECT_SERVER}" == *"/SAML-EXT" ]]; then
-        saml_flow
-    else
-        echo "Unsupported server: ${ANYCONNECT_SERVER}; only SAML-EXT is supported"
-        exit 1
+load_config() {
+    if [[ -f "$CODE_PATH/.env" ]]; then
+        # shellcheck source=/dev/null
+        source "$CODE_PATH/.env"
+    fi
+
+    CONFIGURED_SERVER="${ANYCONNECT_SERVER:-}"
+    CONFIGURED_CERT="${ANYCONNECT_CERT:-}"
+    CONFIGURED_RESOLVE="${ANYCONNECT_RESOLVE:-}"
+    CONFIGURED_HOST="${ANYCONNECT_HOST:-}"
+    CONFIGURED_CONNECT_URL="${ANYCONNECT_CONNECT_URL:-}"
+    USERAGENT="${ANYCONNECT_USERAGENT:-$DEFAULT_USERAGENT}"
+
+    if [[ "$CONFIGURED_SERVER" != */SAML-EXT ]]; then
+        die "Set ANYCONNECT_SERVER in $CODE_PATH/.env to a URL ending in /SAML-EXT."
     fi
 }
 
-auth_var() {
-    local name="$1"
-
-    sed -n "s/^${name}='\\(.*\\)'$/\\1/p" | tail -n 1
+container_state() {
+    container inspect "$NAME" 2>/dev/null | sed -n 's/.*"state" *: *"\([a-z]*\)".*/\1/p' || true
 }
 
-parse_auth_output() {
-    local output="$1"
-    local cookie cert resolve host connect_url
+tunnel_up() {
+    container exec "$NAME" sh -c "$TUNNEL_CHECK" >/dev/null 2>&1
+}
 
-    cookie=$(printf '%s\n' "$output" | auth_var COOKIE)
-    if [[ -z "$cookie" ]]; then
+carries_traffic() {
+    container exec "$NAME" sh -c "$TRAFFIC_CHECK" >/dev/null 2>&1
+}
+
+# Prints absent, the state of a container that is not running, tunnel_down, no_traffic or ready.
+vpn_health() {
+    local state
+    state="$(container_state)"
+
+    if [[ "$state" != running ]]; then
+        echo "${state:-absent}"
+    elif ! tunnel_up; then
+        echo tunnel_down
+    elif ! carries_traffic; then
+        echo no_traffic
+    else
+        echo ready
+    fi
+}
+
+stop_container() {
+    local signal="$1" state
+    state="$(container_state)"
+
+    if [[ "$state" == running ]]; then
+        echo "Stopping the VPN container with $signal..."
+        container stop --signal "$signal" --time "$STOP_TIMEOUT" "$NAME" >/dev/null
+    fi
+    if [[ -n "$state" ]]; then
+        container delete "$NAME" >/dev/null
+    fi
+}
+
+# 'container system status' can report the service as not running while it answers requests.
+system_running() {
+    container ls >/dev/null 2>&1
+}
+
+ensure_system() {
+    system_running || container system start
+}
+
+build_image() {
+    local output
+    container build -t "$IMAGE" -f "$CODE_PATH/Dockerfile" "$CODE_PATH"
+    # The builder VM otherwise stays up holding over 1 GB; the next build restarts it.
+    output="$(container builder stop 2>&1)" || echo "Could not stop the image builder: $output" >&2
+}
+
+ensure_image() {
+    container image inspect "$IMAGE" >/dev/null 2>&1 || build_image
+}
+
+# Reads the cache in a subshell so that cached values never reach authentication.
+use_cached_cookie() {
+    local cached_server
+
+    [[ -s "$COOKIE_PATH" ]] || return 1
+    cached_server="$(
+        # shellcheck source=/dev/null
+        source "$COOKIE_PATH"
+        [[ -n "${ANYCONNECT_COOKIE:-}" ]] && printf '%s' "${ANYCONNECT_SERVER:-}"
+    )" || return 1
+
+    if [[ "$cached_server" != "$CONFIGURED_SERVER" ]]; then
+        echo "Ignoring the cached cookie for $cached_server; the configured server is $CONFIGURED_SERVER."
         return 1
     fi
-
-    cert=$(printf '%s\n' "$output" | auth_var FINGERPRINT)
-    resolve=$(printf '%s\n' "$output" | auth_var RESOLVE)
-    host=$(printf '%s\n' "$output" | auth_var HOST)
-    connect_url=$(printf '%s\n' "$output" | auth_var CONNECT_URL)
-
-    ANYCONNECT_COOKIE="$cookie"
-    [[ -n "$cert" && "$cert" != "pin-sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" ]] && ANYCONNECT_CERT="$cert"
-    [[ -n "$resolve" ]] && ANYCONNECT_RESOLVE="$resolve"
-    [[ -n "$host" ]] && ANYCONNECT_HOST="$host"
-    [[ -n "$connect_url" ]] && ANYCONNECT_CONNECT_URL="$connect_url"
-
-    return 0
+    echo "Using the cached cookie."
 }
 
-write_cookie_file() {
-    local tmp_path
+# Prints the last NAME='value' assignment in the openconnect output, or the fallback.
+auth_value() {
+    local name="$1" output="$2" fallback="${3:-}" value
+    value="$(printf '%s\n' "$output" | sed -n "s/^$name='\(.*\)'\$/\1/p" | tail -n 1)"
+    printf '%s' "${value:-$fallback}"
+}
 
-    mkdir -p "${STATE_DIR}" || return $?
-    chmod 700 "${STATE_DIR}" || return $?
+save_session() {
+    local cookie="$1" connect_url="$2" host="$3" pin="$4" resolve="$5" tmp_path
 
-    tmp_path="$(umask 077 && mktemp "${COOKIE_PATH}.XXXXXX")" || return $?
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    tmp_path="$(mktemp "$COOKIE_PATH.XXXXXX")"
+    chmod 600 "$tmp_path"
     printf 'export %s=%q\n' \
-        ANYCONNECT_SERVER "$ANYCONNECT_SERVER" \
-        ANYCONNECT_CONNECT_URL "${ANYCONNECT_CONNECT_URL:-}" \
-        ANYCONNECT_HOST "${ANYCONNECT_HOST:-}" \
-        ANYCONNECT_CERT "${ANYCONNECT_CERT:-}" \
-        ANYCONNECT_RESOLVE "${ANYCONNECT_RESOLVE:-}" \
-        ANYCONNECT_COOKIE "$ANYCONNECT_COOKIE" >"${tmp_path}" || return $?
-
-    chmod 600 "${tmp_path}" || return $?
-    mv "${tmp_path}" "${COOKIE_PATH}"
+        ANYCONNECT_SERVER "$CONFIGURED_SERVER" \
+        ANYCONNECT_CONNECT_URL "$connect_url" \
+        ANYCONNECT_HOST "$host" \
+        ANYCONNECT_CERT "$pin" \
+        ANYCONNECT_RESOLVE "$resolve" \
+        ANYCONNECT_COOKIE "$cookie" >"$tmp_path"
+    mv "$tmp_path" "$COOKIE_PATH"
 }
 
-compose_up() {
-    local status
+authenticate() {
+    local output cookie pin
+    local args=(--useragent "$USERAGENT" --authenticate)
 
-    mkdir -p "${STATE_DIR}"
-    chmod 700 "${STATE_DIR}"
+    if [[ -n "$CONFIGURED_CERT" ]]; then
+        args+=(--servercert "$CONFIGURED_CERT")
+    fi
+    if [[ -n "$CONFIGURED_RESOLVE" ]]; then
+        args+=(--resolve "$CONFIGURED_RESOLVE")
+    fi
 
-    COMPOSE_START_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    set +e
-    (cd "$CODE_PATH" && "${DOCKER_COMPOSE[@]}" up "$@")
-    status=$?
-    docker logs --since "$COMPOSE_START_TIME" --tail 80 anyconnect_vpn || true
-    set -e
+    echo "Logging in to $CONFIGURED_SERVER..."
+    output="$(openconnect "${args[@]}" "$CONFIGURED_SERVER")" || die "Login failed."
 
-    return "$status"
+    cookie="$(auth_value COOKIE "$output")"
+    [[ -n "$cookie" ]] || die "Login returned no cookie."
+
+    pin="$(auth_value FINGERPRINT "$output")"
+    if [[ -z "$pin" || "$pin" == "$EMPTY_PIN" ]]; then
+        pin="$CONFIGURED_CERT"
+    fi
+
+    save_session "$cookie" \
+        "$(auth_value CONNECT_URL "$output" "$CONFIGURED_CONNECT_URL")" \
+        "$(auth_value HOST "$output" "$CONFIGURED_HOST")" \
+        "$pin" \
+        "$(auth_value RESOLVE "$output" "$CONFIGURED_RESOLVE")"
 }
 
-stack_ready() {
-    local proxy_state vpn_state
-
-    vpn_state=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' anyconnect_vpn 2>/dev/null) || return 1
-    proxy_state=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' anyconnect_proxy 2>/dev/null) || return 1
-
-    [[ "$vpn_state" == "running healthy" && "$proxy_state" == "running healthy" ]]
+run_container() {
+    container run -d --name "$NAME" \
+        --cpus "$CONTAINER_CPUS" --memory "$CONTAINER_MEMORY" \
+        --cap-add NET_ADMIN \
+        --network "default,mtu=$NETWORK_MTU" \
+        --kernel-arg "sysctl.net.core.rmem_default=$UDP_RECEIVE_BUFFER_BYTES" \
+        --mount "type=bind,source=$STATE_DIR,target=/run/anyconnect,readonly" \
+        -p "127.0.0.1:$PROXY_PORT:$PROXY_PORT" \
+        --env "PROXY_PORT=$PROXY_PORT" \
+        --env "VPN_RESOLV_CONF=$VPN_RESOLV_CONF" \
+        --env "ANYCONNECT_USERAGENT=$USERAGENT" \
+        "$IMAGE" >/dev/null
 }
 
-start_vpn() {
-    local failure_reason
+# Polls the check until it passes. Fails with 1 if the container exits, or prints the message and fails with
+# TIMED_OUT_STATUS once the timeout runs out.
+wait_for() {
+    local check="$1" deadline=$((SECONDS + $2)) message="$3"
 
-    authenticate || return $?
+    until "$check"; do
+        if [[ "$(container_state)" != running ]]; then
+            echo "The VPN container exited." >&2
+            return 1
+        fi
+        if ((SECONDS >= deadline)); then
+            echo "$message" >&2
+            return "$TIMED_OUT_STATUS"
+        fi
+        sleep "$POLL_INTERVAL"
+    done
+}
 
-    if compose_up "$@"; then
+# Fails with TIMED_OUT_STATUS only if the tunnel came up but carried no traffic in time.
+wait_until_ready() {
+    wait_for tunnel_up "$READY_TIMEOUT" "The VPN was not ready after ${READY_TIMEOUT}s." || return 1
+    wait_for carries_traffic "$TRAFFIC_TIMEOUT" "The tunnel carried no traffic for ${TRAFFIC_TIMEOUT}s."
+}
+
+# Fails like wait_until_ready. Callers test the result, which turns off errexit here, so failures are checked
+# explicitly.
+start_container() {
+    local result=0
+
+    stop_container SIGHUP
+    echo "Starting the VPN container..."
+    run_container || return 1
+
+    wait_until_ready || result=$?
+    if ((result == 0)); then
+        echo "Connected. SOCKS5 proxy: socks5h://127.0.0.1:$PROXY_PORT"
+        return 0
+    fi
+    echo "Container logs:" >&2
+    container logs "$NAME" >&2 || true
+    return "$result"
+}
+
+session_rejected() {
+    local logs
+    logs="$(container logs "$NAME" 2>&1)" || return 1
+    grep -Eq "$REJECTED_SESSION" <<<"$logs"
+}
+
+connect() {
+    local from_cache=0 result=0
+
+    if [[ "$(vpn_health)" == ready ]]; then
+        echo "Already connected; nothing to do."
         return 0
     fi
 
-    if [[ "${ANYCONNECT_COOKIE_FROM_CACHE:-}" == "1" ]] && failure_reason=$(vpn_cached_auth_failure); then
-        echo "Cached ${failure_reason}; re-authenticating..."
-        rm -f "${COOKIE_PATH}"
-        ANYCONNECT_COOKIE=""
-        authenticate || return $?
-        # Recreate namespace-sharing services after cached authentication fails.
-        # Restarting only the VPN can leave the proxy attached to the old network
-        # namespace and permanently unhealthy.
-        compose_up --force-recreate "$@"
-        return $?
+    load_config
+    ensure_system
+    ensure_image
+
+    if use_cached_cookie; then
+        from_cache=1
+    else
+        authenticate
     fi
 
-    return 1
-}
-
-vpn_cached_auth_failure() {
-    local logs
-
-    logs=$(docker logs --since "$COMPOSE_START_TIME" --tail 120 anyconnect_vpn 2>&1) || return 1
-    if printf '%s\n' "$logs" | grep -Eq "None of the [0-9]+ fingerprint\(s\) specified via --servercert match server's certificate"; then
-        echo "certificate pin no longer matches the VPN gateway"
-    elif printf '%s\n' "$logs" | grep -Eq "Cookie was rejected by server|401 Unauthorized"; then
-        echo "cookie was rejected by the VPN gateway"
+    start_container || result=$?
+    if ((result == 0)); then
+        return 0
+    elif ((!from_cache)); then
+        return 1
+    elif ((result == TIMED_OUT_STATUS)); then
+        echo "The cached session carries no traffic; logging in again."
+    elif session_rejected; then
+        echo "The gateway rejected the cached session; logging in again."
     else
         return 1
     fi
+
+    rm -f "$COOKIE_PATH"
+    authenticate
+    start_container || return 1
 }
 
-saml_flow() {
-    local output
-    local openconnect_args
-    local cached_server
+disconnect() {
+    stop_container SIGHUP
+    echo "Disconnected; the session is kept."
+}
 
-    ANYCONNECT_COOKIE_FROM_CACHE=0
+logout() {
+    local message="The VPN was not running; no cached cookie remains."
 
-    if [[ -s "$COOKIE_PATH" ]]; then
-        echo "Using existing cookie..."
-        # shellcheck disable=SC1090
-        source "${COOKIE_PATH}"
+    if [[ "$(container_state)" == running ]]; then
+        message="Logged out; no cached cookie remains."
+    fi
+    stop_container SIGTERM
+    rm -f "$COOKIE_PATH"
+    echo "$message"
+}
+
+status() {
+    local health
+
+    if ! system_running; then
+        echo "The container system service is not running."
+        return 0
     fi
 
-    if [[ -n "${ANYCONNECT_COOKIE:-}" ]]; then
-        cached_server="${ANYCONNECT_SERVER:-}"
-
-        if [[ -n "$cached_server" && "$cached_server" != "$CONFIGURED_SERVER" ]]; then
-            echo "Ignoring existing cookie for ${cached_server}; configured server is ${CONFIGURED_SERVER}."
-            ANYCONNECT_COOKIE=""
-        else
-            ANYCONNECT_COOKIE_FROM_CACHE=1
-        fi
-    fi
-
-    if [[ -z "${ANYCONNECT_COOKIE}" ]]; then
-        ANYCONNECT_SERVER="$CONFIGURED_SERVER"
-        ANYCONNECT_CONNECT_URL="$CONFIGURED_CONNECT_URL"
-        ANYCONNECT_HOST="$CONFIGURED_HOST"
-        ANYCONNECT_CERT="$CONFIGURED_CERT"
-        ANYCONNECT_RESOLVE="$CONFIGURED_RESOLVE"
-
-        echo "Connecting to ${ANYCONNECT_SERVER}..."
-        openconnect_args=(
-            --useragent="${ANYCONNECT_USERAGENT}"
-            --authenticate
-        )
-
-        [[ -n "${ANYCONNECT_RESOLVE:-}" ]] && openconnect_args+=(--resolve "${ANYCONNECT_RESOLVE}")
-        [[ -n "${ANYCONNECT_CERT:-}" ]] && openconnect_args+=(--servercert "${ANYCONNECT_CERT}")
-
-        output=$(openconnect "${openconnect_args[@]}" "${ANYCONNECT_SERVER}") || return $?
-        if ! parse_auth_output "$output"; then
-            echo "Failed to parse authentication cookie from openconnect output."
-            exit 1
-        fi
-
-        write_cookie_file || return $?
-    fi
-
-    export ANYCONNECT_SERVER
-    export ANYCONNECT_PUBLIC_KEY
-    export ANYCONNECT_USER
-    export ANYCONNECT_USERAGENT
+    health="$(vpn_health)"
+    case "$health" in
+    absent) echo "$NAME: no container" ;;
+    tunnel_down) echo "$NAME: running, tunnel not up" ;;
+    no_traffic) echo "$NAME: running, tunnel up but carries no traffic" ;;
+    ready) echo "$NAME: running, tunnel ready" ;;
+    *) echo "$NAME: $health" ;;
+    esac
 }
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [up|start|on|off|restart|rebuild|clear|clean|status|help|docker-compose args...]
+Usage: $(basename "$0") <command>
 
 Commands:
-  up, start, on  No-op if running; otherwise start with the cached cookie
-  off            Stop and remove the stack, keeping the cookie
-  restart        Recreate the stack with the cached cookie, without rebuilding
-  rebuild        Build images and recreate the stack
-  clear          Delete the cookie, authenticate, then start the stack
-  clean          Stop and remove the stack, then delete the cookie
-  status         Show stack status
-  help           Show this help
+  connect, up, start, on       Connect; reuse the cached session or log in. No-op if connected.
+  disconnect, down, stop, off  Disconnect and keep the session.
+  reconnect, restart           Disconnect, then connect, without rebuilding the image.
+  rebuild                      Rebuild the image, then reconnect.
+  logout                       End the session if connected and delete the cached cookie.
+  status                       Show the container state and whether the tunnel carries traffic.
+  logs [args]                  Show the container logs; args go to 'container logs'.
+  help, -h, --help             Show this help.
 EOF
 }
 
-DOCKER_COMPOSE=(docker-compose)
-if docker compose version >/dev/null 2>&1; then
-    DOCKER_COMPOSE=(docker compose)
-fi
-
-DOCKER_COMPOSE_UP_ARGS=(--detach --remove-orphans)
-DOCKER_COMPOSE_RESTART_ARGS=(--detach --force-recreate --remove-orphans)
-DOCKER_COMPOSE_REBUILD_ARGS=(--detach --build --force-recreate --remove-orphans)
-
-op="${1:-status}"
+action="${1:-help}"
 shift || true
 
-case $op in
-on | up | start)
-    if stack_ready; then
-        echo "VPN stack is already running; nothing to do."
-        exit 0
-    fi
-    start_vpn "${DOCKER_COMPOSE_UP_ARGS[@]}" "$@"
+case "$action" in
+connect | up | start | on)
+    connect
     ;;
-off)
-    (cd "$CODE_PATH" && "${DOCKER_COMPOSE[@]}" down "$@")
+disconnect | down | stop | off)
+    disconnect
     ;;
-restart)
-    start_vpn "${DOCKER_COMPOSE_RESTART_ARGS[@]}" "$@"
+reconnect | restart)
+    load_config
+    disconnect
+    connect
     ;;
 rebuild)
-    start_vpn "${DOCKER_COMPOSE_REBUILD_ARGS[@]}" "$@"
+    load_config
+    ensure_system
+    build_image
+    disconnect
+    connect
     ;;
-clear)
-    rm -f "${COOKIE_PATH}"
-    start_vpn "${DOCKER_COMPOSE_RESTART_ARGS[@]}" "$@"
-    ;;
-clean)
-    (cd "$CODE_PATH" && "${DOCKER_COMPOSE[@]}" down --remove-orphans "$@")
-    rm -f "${COOKIE_PATH}"
+logout)
+    logout
     ;;
 status)
-    (cd "$CODE_PATH" && "${DOCKER_COMPOSE[@]}" ps "$@")
+    status
+    ;;
+logs)
+    container logs "$@" "$NAME"
     ;;
 help | -h | --help)
     usage
     ;;
-*) # unknown option
-    (cd "$CODE_PATH" && "${DOCKER_COMPOSE[@]}" "$op" "$@")
+*)
+    usage >&2
+    exit 2
     ;;
 esac
